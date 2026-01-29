@@ -203,3 +203,193 @@ def routes_for_stop(
         )
 
     return {"stop_id": stop_id, "count": len(items), "items": items}
+
+from datetime import datetime
+from fastapi import HTTPException
+
+@app.get("/api/trips/next")
+def next_trips(
+    stop_id: str = Query(..., description="GTFS stop_id"),
+    route_id: Optional[str] = Query(None, description="Filter by route_id"),
+    direction_id: Optional[int] = Query(None, ge=0, le=1, description="0/1"),
+    limit: int = Query(5, ge=1, le=50, description="Max results"),
+    tz: str = Query("Asia/Bangkok", description="IANA timezone name"),
+):
+    """
+    Next scheduled departures at a stop (no realtime).
+    Uses GTFS tables:
+      - gtfs.stop_times(stop_id, trip_id, arrival_time, departure_time, stop_sequence)
+      - gtfs.trips(trip_id, route_id, service_id, trip_headsign, direction_id)
+      - gtfs.routes(route_id, route_short_name, route_long_name, route_type, agency_id)
+      - gtfs.calendar(service_id, monday..sunday, start_date, end_date)
+      - gtfs.calendar_dates(service_id, date, exception_type)
+
+    Handles GTFS times beyond 24:00:00 (e.g., 25:10:00).
+    """
+
+    stop_id = stop_id.strip()
+    if not stop_id:
+        raise HTTPException(status_code=400, detail="stop_id is required")
+
+    # ---- SQL pieces ----
+    # Convert 'HH:MM:SS' (HH may be > 24) to seconds
+    time_to_sec_sql = """
+      (split_part(%s, ':', 1)::int * 3600) +
+      (split_part(%s, ':', 2)::int * 60) +
+      (split_part(%s, ':', 3)::int)
+    """
+
+    # NOTE: We use DB time (now()) at requested timezone.
+    # Compute "service date" = local date at tz.
+    sql = f"""
+    WITH
+    params AS (
+      SELECT
+        %s::text   AS stop_id,
+        %s::text   AS route_id,
+        %s::int    AS direction_id,
+        %s::int    AS limit_n,
+        %s::text   AS tz
+    ),
+    now_local AS (
+      SELECT
+        (now() AT TIME ZONE (SELECT tz FROM params)) AS now_ts,
+        (now() AT TIME ZONE (SELECT tz FROM params))::date AS svc_date
+    ),
+
+    -- Active service_ids for today from calendar + calendar_dates
+    base_services AS (
+      SELECT c.service_id
+      FROM gtfs.calendar c, now_local n
+      WHERE n.svc_date BETWEEN to_date(c.start_date::text, 'YYYYMMDD') AND to_date(c.end_date::text, 'YYYYMMDD')
+        AND (
+          CASE extract(dow from n.svc_date)
+            WHEN 0 THEN c.sunday
+            WHEN 1 THEN c.monday
+            WHEN 2 THEN c.tuesday
+            WHEN 3 THEN c.wednesday
+            WHEN 4 THEN c.thursday
+            WHEN 5 THEN c.friday
+            WHEN 6 THEN c.saturday
+          END
+        ) = 1
+    ),
+    added_services AS (
+      SELECT cd.service_id
+      FROM gtfs.calendar_dates cd, now_local n
+      WHERE cd.exception_type = 1
+        AND to_date(cd.date::text, 'YYYYMMDD') = n.svc_date
+    ),
+    removed_services AS (
+      SELECT cd.service_id
+      FROM gtfs.calendar_dates cd, now_local n
+      WHERE cd.exception_type = 2
+        AND to_date(cd.date::text, 'YYYYMMDD') = n.svc_date
+    ),
+    active_services AS (
+      SELECT service_id FROM base_services
+      UNION
+      SELECT service_id FROM added_services
+      EXCEPT
+      SELECT service_id FROM removed_services
+    ),
+
+    candidates AS (
+      SELECT
+        st.stop_id,
+        st.trip_id,
+        st.stop_sequence,
+        st.arrival_time,
+        st.departure_time,
+        t.route_id,
+        t.service_id,
+        t.trip_headsign,
+        t.direction_id,
+        r.route_short_name,
+        r.route_long_name,
+        r.route_type,
+        r.agency_id,
+
+        -- seconds since service-day start (can be > 86400)
+        (
+          (split_part(st.departure_time, ':', 1)::int * 3600) +
+          (split_part(st.departure_time, ':', 2)::int * 60) +
+          (split_part(st.departure_time, ':', 3)::int)
+        ) AS dep_sec,
+
+        (
+          (split_part(st.arrival_time, ':', 1)::int * 3600) +
+          (split_part(st.arrival_time, ':', 2)::int * 60) +
+          (split_part(st.arrival_time, ':', 3)::int)
+        ) AS arr_sec
+
+      FROM gtfs.stop_times st
+      JOIN gtfs.trips t  ON t.trip_id = st.trip_id
+      JOIN gtfs.routes r ON r.route_id = t.route_id
+      JOIN active_services a ON a.service_id = t.service_id
+      JOIN params p ON true
+      WHERE st.stop_id = p.stop_id
+        AND (p.route_id IS NULL OR t.route_id = p.route_id)
+        AND (p.direction_id IS NULL OR t.direction_id = p.direction_id)
+    ),
+
+    ranked AS (
+      SELECT
+        c.*,
+        n.now_ts,
+        n.svc_date,
+        -- Convert dep_sec to a local timestamp (svc_date + dep_sec)
+        (n.svc_date::timestamp + make_interval(secs => c.dep_sec)) AS departure_ts,
+        (n.svc_date::timestamp + make_interval(secs => c.arr_sec)) AS arrival_ts
+      FROM candidates c
+      CROSS JOIN now_local n
+      WHERE (n.svc_date::timestamp + make_interval(secs => c.dep_sec)) >= n.now_ts
+      ORDER BY (n.svc_date::timestamp + make_interval(secs => c.dep_sec)) ASC
+      LIMIT (SELECT limit_n FROM params)
+    )
+    SELECT
+      stop_id, trip_id, route_id, direction_id, trip_headsign,
+      route_short_name, route_long_name, route_type, agency_id,
+      stop_sequence, arrival_time, departure_time,
+      departure_ts, arrival_ts
+    FROM ranked;
+    """
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                sql,
+                (stop_id, route_id, direction_id, limit, tz),
+            )
+            rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "trip_id": r["trip_id"],
+                "route_id": r["route_id"],
+                "route_short_name": r["route_short_name"],
+                "route_long_name": r["route_long_name"],
+                "route_type": r["route_type"],
+                "agency_id": r["agency_id"],
+                "direction_id": r["direction_id"],
+                "trip_headsign": r["trip_headsign"],
+                "stop_sequence": r["stop_sequence"],
+                "arrival_time": r["arrival_time"],
+                "departure_time": r["departure_time"],
+                # ISO strings
+                "arrival_ts": r["arrival_ts"].isoformat() if r["arrival_ts"] else None,
+                "departure_ts": r["departure_ts"].isoformat() if r["departure_ts"] else None,
+            }
+        )
+
+    return {
+        "stop_id": stop_id,
+        "route_id": route_id,
+        "direction_id": direction_id,
+        "tz": tz,
+        "count": len(items),
+        "items": items,
+    }
+
