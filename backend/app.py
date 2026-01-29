@@ -334,6 +334,673 @@ def routes_for_stop(
     return {"stop_id": stop_id, "count": len(items), "items": items}
 
 # -----------------------------
-# (ส่วนที่เหลือของคุณ: next_trips, route_shape, trip_stops, route_stops, coverage, plan, plan1x)
-# ให้ “คงเดิม” ตามไฟล์เดิมได้เลย
+# Next Trips (stable time parsing + calendar_dates)
 # -----------------------------
+@app.get("/api/trips/next")
+def next_trips(
+    stop_id: str = Query(..., description="GTFS stop_id"),
+    route_id: Optional[str] = Query(None, description="Optional filter by route_id"),
+    direction_id: Optional[int] = Query(None, ge=0, le=1, description="Optional filter 0/1"),
+    limit: int = Query(5, ge=1, le=30, description="Max results"),
+    days_ahead: int = Query(7, ge=1, le=30, description="How many days ahead to search if today has no trips"),
+    tz: str = Query("Asia/Bangkok", description="Timezone for time comparison"),
+):
+    stop_id = stop_id.strip()
+    if not stop_id:
+        raise HTTPException(status_code=400, detail="stop_id is required")
+
+    try:
+        tzinfo = ZoneInfo(tz)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Invalid tz: {tz}")
+
+    now = datetime.now(tzinfo)
+    today = now.date()
+    now_time_str = now.strftime("%H:%M:%S")
+
+    with get_conn() as conn:
+        for i in range(days_ahead):
+            d = today + timedelta(days=i)
+            service_ids = _service_ids_for_date(conn, d)
+            if not service_ids:
+                continue
+
+            time_filter_sql = ""
+            time_params: List[Any] = []
+            if i == 0:
+                time_filter_sql = "AND st.departure_time >= %s"
+                time_params.append(now_time_str)
+
+            route_filter_sql = ""
+            route_params: List[Any] = []
+            if route_id:
+                route_filter_sql = "AND r.route_id = %s"
+                route_params.append(route_id)
+
+            dir_filter_sql = ""
+            dir_params: List[Any] = []
+            if direction_id is not None:
+                dir_filter_sql = "AND t.direction_id = %s"
+                dir_params.append(int(direction_id))
+
+            sql = f"""
+            SELECT
+              %s::text AS service_date,
+              st.stop_id,
+              st.trip_id,
+              st.arrival_time,
+              st.departure_time,
+              st.stop_sequence,
+
+              t.route_id,
+              t.service_id,
+              t.direction_id,
+              t.trip_headsign,
+
+              r.route_short_name,
+              r.route_long_name,
+              r.route_type,
+              r.agency_id
+            FROM gtfs.stop_times st
+            JOIN gtfs.trips t ON t.trip_id = st.trip_id
+            JOIN gtfs.routes r ON r.route_id = t.route_id
+            WHERE st.stop_id = %s
+              AND t.service_id = ANY(%s)
+              {time_filter_sql}
+              {route_filter_sql}
+              {dir_filter_sql}
+            ORDER BY st.departure_time ASC
+            LIMIT %s;
+            """
+
+            params: List[Any] = []
+            params.append(d.isoformat())
+            params.append(stop_id)
+            params.append(service_ids)
+            params.extend(time_params)
+            params.extend(route_params)
+            params.extend(dir_params)
+            params.append(limit)
+
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+
+            if rows:
+                items: List[Dict[str, Any]] = []
+                for r in rows:
+                    service_d = date.fromisoformat(r["service_date"])
+                    try:
+                        dep_dt = gtfs_time_to_dt(service_d, r["departure_time"], tzinfo)
+                    except Exception:
+                        dep_dt = None
+                    try:
+                        arr_dt = gtfs_time_to_dt(service_d, r["arrival_time"], tzinfo)
+                    except Exception:
+                        arr_dt = None
+
+                    items.append(
+                        {
+                            "service_date": r["service_date"],
+                            "stop_id": r["stop_id"],
+                            "trip_id": r["trip_id"],
+                            "route_id": r["route_id"],
+                            "service_id": r["service_id"],
+                            "direction_id": r["direction_id"],
+                            "trip_headsign": r["trip_headsign"],
+                            "departure_time": r["departure_time"],
+                            "arrival_time": r["arrival_time"],
+                            "departure_dt": dep_dt.isoformat() if dep_dt else None,
+                            "arrival_dt": arr_dt.isoformat() if arr_dt else None,
+                            "stop_sequence": int(r["stop_sequence"]) if r["stop_sequence"] is not None else None,
+                            "route_short_name": r["route_short_name"],
+                            "route_long_name": r["route_long_name"],
+                            "route_type": r["route_type"],
+                            "agency_id": r.get("agency_id"),
+                        }
+                    )
+
+                return {
+                    "stop_id": stop_id,
+                    "route_id": route_id,
+                    "direction_id": direction_id,
+                    "tz": tz,
+                    "now": now.isoformat(),
+                    "searched_days": i + 1,
+                    "count": len(items),
+                    "items": items,
+                }
+
+    return {"stop_id": stop_id, "route_id": route_id, "direction_id": direction_id, "tz": tz, "count": 0, "items": []}
+
+
+# -----------------------------
+# Route Shape (representative = most common shape_id)
+# -----------------------------
+@app.get("/api/routes/{route_id}/shape")
+def route_shape(
+    route_id: str,
+    direction_id: Optional[int] = Query(None, description="0 or 1 (optional)"),
+):
+    pick_sql = """
+    SELECT
+      t.shape_id,
+      COUNT(*) AS n_trips
+    FROM gtfs.trips t
+    WHERE t.route_id = %s
+      AND t.shape_id IS NOT NULL
+    """
+    params: List[Any] = [route_id]
+    if direction_id is not None:
+        pick_sql += " AND t.direction_id = %s"
+        params.append(int(direction_id))
+
+    pick_sql += """
+    GROUP BY t.shape_id
+    ORDER BY n_trips DESC, t.shape_id
+    LIMIT 1;
+    """
+
+    geom_sql = """
+    SELECT
+      sl.shape_id,
+      ST_AsGeoJSON(sl.geom)::json AS geojson
+    FROM gtfs.shape_lines sl
+    WHERE sl.shape_id = %s
+    LIMIT 1;
+    """
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(pick_sql, params)
+            pick = cur.fetchone()
+
+            if not pick:
+                return JSONResponse(
+                    status_code=404,
+                    content={"route_id": route_id, "direction_id": direction_id, "error": "no shape_id found in trips"},
+                )
+
+            shape_id = pick["shape_id"]
+            cur.execute(geom_sql, (shape_id,))
+            row = cur.fetchone()
+
+    if not row or row["geojson"] is None:
+        return JSONResponse(
+            status_code=404,
+            content={"route_id": route_id, "direction_id": direction_id, "shape_id": shape_id, "error": "shape geometry not found"},
+        )
+
+    return {
+        "route_id": route_id,
+        "direction_id": direction_id,
+        "shape_id": shape_id,
+        "shape_trip_count": int(pick["n_trips"]),
+        "type": "Feature",
+        "geometry": row["geojson"],
+        "properties": {"route_id": route_id, "direction_id": direction_id},
+    }
+
+
+# -----------------------------
+# Trip Stops (stop sequence)
+# -----------------------------
+@app.get("/api/trips/{trip_id}/stops")
+def trip_stops(trip_id: str):
+    sql = """
+    SELECT
+      st.stop_sequence,
+      st.stop_id,
+      s.stop_name AS stop_name,
+      s.stop_lat::double precision AS lat,
+      s.stop_lon::double precision AS lon,
+      st.arrival_time,
+      st.departure_time
+    FROM gtfs.stop_times st
+    JOIN gtfs.stops s ON s.stop_id = st.stop_id
+    WHERE st.trip_id = %s
+    ORDER BY st.stop_sequence ASC;
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (trip_id,))
+            rows = cur.fetchall()
+
+    return {"trip_id": trip_id, "count": len(rows), "items": rows}
+
+
+# -----------------------------
+# Route Stops (representative trip)
+# -----------------------------
+@app.get("/api/routes/{route_id}/stops")
+def route_stops(
+    route_id: str,
+    direction_id: Optional[int] = Query(None, description="0 or 1 (optional)"),
+):
+    trip_sql = """
+    SELECT t.trip_id
+    FROM gtfs.trips t
+    JOIN gtfs.stop_times st ON st.trip_id = t.trip_id
+    WHERE t.route_id = %s
+    """
+    params: List[Any] = [route_id]
+    if direction_id is not None:
+        trip_sql += " AND t.direction_id = %s"
+        params.append(int(direction_id))
+
+    trip_sql += """
+    GROUP BY t.trip_id
+    ORDER BY COUNT(*) DESC
+    LIMIT 1;
+    """
+
+    stops_sql = """
+    SELECT
+      st.stop_sequence,
+      st.stop_id,
+      s.stop_name AS stop_name,
+      s.stop_lat::double precision AS lat,
+      s.stop_lon::double precision AS lon
+    FROM gtfs.stop_times st
+    JOIN gtfs.stops s ON s.stop_id = st.stop_id
+    WHERE st.trip_id = %s
+    ORDER BY st.stop_sequence ASC;
+    """
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(trip_sql, params)
+            trip = cur.fetchone()
+
+            if not trip:
+                return JSONResponse(
+                    status_code=404,
+                    content={"route_id": route_id, "direction_id": direction_id, "error": "no trip found"},
+                )
+
+            rep_trip_id = trip["trip_id"]
+            cur.execute(stops_sql, (rep_trip_id,))
+            rows = cur.fetchall()
+
+    return {
+        "route_id": route_id,
+        "direction_id": direction_id,
+        "representative_trip_id": rep_trip_id,
+        "count": len(rows),
+        "items": rows,
+    }
+
+
+# -----------------------------
+# Network Coverage (bbox)
+# -----------------------------
+@app.get("/api/network/coverage")
+def network_coverage():
+    sql = """
+    SELECT
+      COUNT(*)::bigint AS stop_count,
+      MIN(stop_lon)::double precision AS min_lon,
+      MIN(stop_lat)::double precision AS min_lat,
+      MAX(stop_lon)::double precision AS max_lon,
+      MAX(stop_lat)::double precision AS max_lat
+    FROM gtfs.stops
+    WHERE stop_lon IS NOT NULL AND stop_lat IS NOT NULL;
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql)
+            r = cur.fetchone()
+
+    return {
+        "stop_count": int(r["stop_count"] or 0),
+        "bbox": [r["min_lon"], r["min_lat"], r["max_lon"], r["max_lat"]],
+    }
+
+
+# -----------------------------
+# Route Plan (Direct-only, calendar_dates supported)
+# -----------------------------
+@app.get("/api/route/plan")
+def route_plan(
+    origin_stop_id: str = Query(...),
+    dest_stop_id: str = Query(...),
+    depart_dt: Optional[str] = Query(None, description="ISO datetime, e.g. 2026-01-29T08:30:00"),
+    tz: str = Query("Asia/Bangkok"),
+    limit: int = Query(3, ge=1, le=10),
+):
+    try:
+        z = ZoneInfo(tz)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": f"Invalid tz: {tz}"})
+
+    now = datetime.now(z)
+    if depart_dt:
+        try:
+            depart = datetime.fromisoformat(depart_dt)
+            if depart.tzinfo is None:
+                depart = depart.replace(tzinfo=z)
+            else:
+                depart = depart.astimezone(z)
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "depart_dt must be ISO datetime"})
+    else:
+        depart = now
+
+    service_day = depart.date()
+    depart_time_str = depart.strftime("%H:%M:%S")
+
+    sql = """
+    WITH candidates AS (
+      SELECT
+        t.trip_id,
+        t.route_id,
+        t.service_id,
+        t.direction_id,
+        t.trip_headsign,
+        st_o.departure_time AS depart_time,
+        st_d.arrival_time   AS arrive_time,
+        st_o.stop_sequence  AS o_seq,
+        st_d.stop_sequence  AS d_seq
+      FROM gtfs.trips t
+      JOIN gtfs.stop_times st_o ON st_o.trip_id = t.trip_id AND st_o.stop_id = %s
+      JOIN gtfs.stop_times st_d ON st_d.trip_id = t.trip_id AND st_d.stop_id = %s
+      WHERE st_d.stop_sequence > st_o.stop_sequence
+        AND t.service_id = ANY(%s)
+        AND st_o.departure_time >= %s
+    )
+    SELECT
+      c.*,
+      r.route_short_name,
+      r.route_long_name,
+      r.route_type,
+      r.agency_id
+    FROM candidates c
+    JOIN gtfs.routes r ON r.route_id = c.route_id
+    ORDER BY c.depart_time ASC
+    LIMIT %s;
+    """
+
+    with get_conn() as conn:
+        service_ids = _service_ids_for_date(conn, service_day)
+        if not service_ids:
+            return {
+                "origin_stop_id": origin_stop_id,
+                "dest_stop_id": dest_stop_id,
+                "tz": tz,
+                "now": now.isoformat(),
+                "depart_dt": depart.isoformat(),
+                "service_date": service_day.isoformat(),
+                "count": 0,
+                "items": [],
+                "note": "No active service_ids for this date (calendar/calendar_dates).",
+            }
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (origin_stop_id, dest_stop_id, service_ids, depart_time_str, limit))
+            rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        dep_dt = gtfs_time_to_dt(service_day, r["depart_time"], z)
+        arr_dt = gtfs_time_to_dt(service_day, r["arrive_time"], z)
+        items.append({**r, "depart_dt": dep_dt.isoformat(), "arrive_dt": arr_dt.isoformat()})
+
+    return {
+        "origin_stop_id": origin_stop_id,
+        "dest_stop_id": dest_stop_id,
+        "tz": tz,
+        "now": now.isoformat(),
+        "depart_dt": depart.isoformat(),
+        "service_date": service_day.isoformat(),
+        "count": len(items),
+        "items": items,
+        "note": "direct-only (no transfers yet), calendar_dates supported",
+    }
+
+
+# -----------------------------
+# MVP: Walk + 1 Transfer planner
+# -----------------------------
+@app.get("/api/route/plan1x")
+def route_plan_one_transfer(
+    origin_lat: float = Query(...),
+    origin_lon: float = Query(...),
+    dest_lat: float = Query(...),
+    dest_lon: float = Query(...),
+    walk_radius_m: int = Query(800, ge=100, le=5000),
+    transfer_wait_min: int = Query(5, ge=0, le=60),
+    depart_dt: Optional[str] = Query(None, description="ISO datetime, e.g. 2026-01-29T08:30:00"),
+    tz: str = Query("Asia/Bangkok"),
+    limit: int = Query(3, ge=1, le=10),
+):
+    try:
+        z = ZoneInfo(tz)
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": f"Invalid tz: {tz}"})
+
+    now = datetime.now(z)
+    if depart_dt:
+        try:
+            depart = datetime.fromisoformat(depart_dt)
+            if depart.tzinfo is None:
+                depart = depart.replace(tzinfo=z)
+            else:
+                depart = depart.astimezone(z)
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "depart_dt must be ISO datetime"})
+    else:
+        depart = now
+
+    service_day = depart.date()
+    depart_time_str = depart.strftime("%H:%M:%S")
+
+    nearby_sql = """
+    SELECT stop_id,
+           ST_Distance(
+             geom::geography,
+             ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography
+           ) AS dist_m
+    FROM gtfs.stops_search
+    WHERE ST_DWithin(
+      geom::geography,
+      ST_SetSRID(ST_MakePoint(%s,%s),4326)::geography,
+      %s
+    )
+    ORDER BY dist_m ASC
+    LIMIT 50;
+    """
+
+    direct_sql = """
+    WITH o AS (
+      SELECT st.trip_id, st.stop_id AS o_stop, st.stop_sequence AS o_seq, st.departure_time AS o_dep
+      FROM gtfs.stop_times st
+      JOIN gtfs.trips t ON t.trip_id = st.trip_id
+      WHERE st.stop_id = ANY(%s)
+        AND t.service_id = ANY(%s)
+        AND st.departure_time >= %s
+    ),
+    d AS (
+      SELECT st.trip_id, st.stop_id AS d_stop, st.stop_sequence AS d_seq, st.arrival_time AS d_arr
+      FROM gtfs.stop_times st
+      WHERE st.stop_id = ANY(%s)
+    )
+    SELECT
+      o.trip_id, t.route_id, t.direction_id, t.trip_headsign, t.service_id,
+      o.o_stop, d.d_stop, o.o_dep, d.d_arr, o.o_seq, d.d_seq,
+      r.route_short_name, r.route_long_name, r.route_type, r.agency_id
+    FROM o
+    JOIN d ON d.trip_id = o.trip_id AND d.d_seq > o.o_seq
+    JOIN gtfs.trips t ON t.trip_id = o.trip_id
+    JOIN gtfs.routes r ON r.route_id = t.route_id
+    ORDER BY o.o_dep ASC
+    LIMIT %s;
+    """
+
+    one_xfer_sql = """
+    WITH leg1 AS (
+      SELECT
+        st1.trip_id AS trip1,
+        st1.stop_id AS o_stop,
+        stx.stop_id AS x_stop,
+        st1.stop_sequence AS o_seq,
+        stx.stop_sequence AS x_seq,
+        st1.departure_time AS o_dep,
+        stx.arrival_time   AS x_arr
+      FROM gtfs.stop_times st1
+      JOIN gtfs.trips t1 ON t1.trip_id = st1.trip_id
+      JOIN gtfs.stop_times stx ON stx.trip_id = st1.trip_id
+      WHERE st1.stop_id = ANY(%s)
+        AND t1.service_id = ANY(%s)
+        AND st1.departure_time >= %s
+        AND stx.stop_sequence > st1.stop_sequence
+    ),
+    leg2 AS (
+      SELECT
+        stx2.trip_id AS trip2,
+        stx2.stop_id AS x_stop,
+        std.stop_id  AS d_stop,
+        stx2.stop_sequence AS x2_seq,
+        std.stop_sequence  AS d_seq,
+        stx2.departure_time AS x_dep2,
+        std.arrival_time    AS d_arr2
+      FROM gtfs.stop_times stx2
+      JOIN gtfs.trips t2 ON t2.trip_id = stx2.trip_id
+      JOIN gtfs.stop_times std ON std.trip_id = stx2.trip_id
+      WHERE t2.service_id = ANY(%s)
+        AND std.stop_id = ANY(%s)
+        AND std.stop_sequence > stx2.stop_sequence
+    )
+    SELECT
+      l1.trip1, t1.route_id AS route1, t1.direction_id AS dir1, t1.trip_headsign AS head1, t1.service_id AS sid1,
+      l2.trip2, t2.route_id AS route2, t2.direction_id AS dir2, t2.trip_headsign AS head2, t2.service_id AS sid2,
+      l1.o_stop, l1.x_stop, l2.d_stop,
+      l1.o_dep, l1.x_arr, l2.x_dep2, l2.d_arr2,
+      r1.route_short_name AS r1_short, r1.route_long_name AS r1_long, r1.route_type AS r1_type, r1.agency_id AS r1_agency,
+      r2.route_short_name AS r2_short, r2.route_long_name AS r2_long, r2.route_type AS r2_type, r2.agency_id AS r2_agency
+    FROM leg1 l1
+    JOIN leg2 l2 ON l2.x_stop = l1.x_stop
+    JOIN gtfs.trips t1 ON t1.trip_id = l1.trip1
+    JOIN gtfs.trips t2 ON t2.trip_id = l2.trip2
+    JOIN gtfs.routes r1 ON r1.route_id = t1.route_id
+    JOIN gtfs.routes r2 ON r2.route_id = t2.route_id
+    WHERE l2.x_dep2 >= l1.x_arr
+    ORDER BY l1.o_dep ASC, l2.x_dep2 ASC
+    LIMIT %s;
+    """
+
+    with get_conn() as conn:
+        service_ids = _service_ids_for_date(conn, service_day)
+        if not service_ids:
+            return {"count": 0, "items": [], "note": "No active service_ids for this date (calendar/calendar_dates)."}
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(nearby_sql, (origin_lon, origin_lat, origin_lon, origin_lat, walk_radius_m))
+            O = [r["stop_id"] for r in cur.fetchall()]
+
+            cur.execute(nearby_sql, (dest_lon, dest_lat, dest_lon, dest_lat, walk_radius_m))
+            D = [r["stop_id"] for r in cur.fetchall()]
+
+        if not O or not D:
+            return {
+                "count": 0,
+                "items": [],
+                "note": "No nearby stops for origin or destination within walk radius.",
+                "origin_nearby_count": len(O),
+                "dest_nearby_count": len(D),
+            }
+
+        items: List[Dict[str, Any]] = []
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(direct_sql, (O, service_ids, depart_time_str, D, limit))
+            direct_rows = cur.fetchall()
+            for r in direct_rows:
+                dep_dt = gtfs_time_to_dt(service_day, r["o_dep"], z)
+                arr_dt = gtfs_time_to_dt(service_day, r["d_arr"], z)
+                items.append(
+                    {
+                        "type": "direct",
+                        "trip_id": r["trip_id"],
+                        "route_id": r["route_id"],
+                        "direction_id": r["direction_id"],
+                        "trip_headsign": r["trip_headsign"],
+                        "service_id": r["service_id"],
+                        "origin_stop_id": r["o_stop"],
+                        "dest_stop_id": r["d_stop"],
+                        "depart_time": r["o_dep"],
+                        "arrive_time": r["d_arr"],
+                        "depart_dt": dep_dt.isoformat(),
+                        "arrive_dt": arr_dt.isoformat(),
+                        "route_short_name": r["route_short_name"],
+                        "route_long_name": r["route_long_name"],
+                        "route_type": r["route_type"],
+                        "agency_id": r.get("agency_id"),
+                    }
+                )
+
+            cur.execute(one_xfer_sql, (O, service_ids, depart_time_str, service_ids, D, limit))
+            x_rows = cur.fetchall()
+
+            for r in x_rows:
+                dep1 = gtfs_time_to_dt(service_day, r["o_dep"], z)
+                arr1 = gtfs_time_to_dt(service_day, r["x_arr"], z)
+                dep2 = gtfs_time_to_dt(service_day, r["x_dep2"], z)
+                arr2 = gtfs_time_to_dt(service_day, r["d_arr2"], z)
+
+                if dep2 < (arr1 + timedelta(minutes=transfer_wait_min)):
+                    continue
+
+                items.append(
+                    {
+                        "type": "1-transfer",
+                        "origin_stop_id": r["o_stop"],
+                        "transfer_stop_id": r["x_stop"],
+                        "dest_stop_id": r["d_stop"],
+                        "leg1": {
+                            "trip_id": r["trip1"],
+                            "route_id": r["route1"],
+                            "direction_id": r["dir1"],
+                            "trip_headsign": r["head1"],
+                            "service_id": r["sid1"],
+                            "depart_time": r["o_dep"],
+                            "arrive_time": r["x_arr"],
+                            "depart_dt": dep1.isoformat(),
+                            "arrive_dt": arr1.isoformat(),
+                            "route_short_name": r["r1_short"],
+                            "route_long_name": r["r1_long"],
+                            "route_type": r["r1_type"],
+                            "agency_id": r["r1_agency"],
+                        },
+                        "leg2": {
+                            "trip_id": r["trip2"],
+                            "route_id": r["route2"],
+                            "direction_id": r["dir2"],
+                            "trip_headsign": r["head2"],
+                            "service_id": r["sid2"],
+                            "depart_time": r["x_dep2"],
+                            "arrive_time": r["d_arr2"],
+                            "depart_dt": dep2.isoformat(),
+                            "arrive_dt": arr2.isoformat(),
+                            "route_short_name": r["r2_short"],
+                            "route_long_name": r["r2_long"],
+                            "route_type": r["r2_type"],
+                            "agency_id": r["r2_agency"],
+                        },
+                    }
+                )
+
+    return {
+        "tz": tz,
+        "now": now.isoformat(),
+        "depart_dt": depart.isoformat(),
+        "service_date": service_day.isoformat(),
+        "origin": {"lat": origin_lat, "lon": origin_lon},
+        "destination": {"lat": dest_lat, "lon": dest_lon},
+        "walk_radius_m": walk_radius_m,
+        "transfer_wait_min": transfer_wait_min,
+        "origin_nearby_count": len(O),
+        "dest_nearby_count": len(D),
+        "count": len(items[:limit]),
+        "items": items[:limit],
+        "note": "MVP: direct + up to 1 transfer (full time-dependent routing can be added later)",
+    }
