@@ -4,13 +4,14 @@
 # - Stable GTFS time parsing (supports 24+ hour times)
 # - calendar + calendar_dates service filtering
 # - Stops autocomplete / nearby
-# - Routes for stop
+# - Routes for stop (robust even if routes.agency_id missing)
 # - Next trips
 # - Route shape (representative / most common)
 # - Trip stops / Route stops
 # - Network coverage
 # - Direct route plan (calendar_dates supported)
 # - MVP walk + 1 transfer planner
+# - FIXED CORS: explicit origins OR wildcard without credentials
 # ============================================================
 
 import os
@@ -29,17 +30,50 @@ from fastapi.responses import JSONResponse
 app = FastAPI(title="GTFS Transit API", version="1.2")
 
 # -----------------------------
-# CORS
+# CORS (FIXED)
 # -----------------------------
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+# Recommended:
+#   - Set ALLOWED_ORIGINS as comma-separated list of exact origins
+#     e.g. "http://localhost:5173,https://yourdomain.com"
+# Optional:
+#   - Set ALLOWED_ORIGIN_REGEX for preview domains
+#     e.g. "^https://.*\\.netlify\\.app$"
+#
+# Important rule:
+#   - If allow_credentials=True then allow_origins CANNOT contain "*"
+#
+raw_origins = os.getenv("ALLOWED_ORIGINS", "*").strip()
+allowed_origins = [o.strip() for o in raw_origins.split(",") if o.strip()]
+allowed_origin_regex = os.getenv("ALLOWED_ORIGIN_REGEX", "").strip()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
-    allow_credentials=True,
+# If wildcard, force credentials off (browser restriction)
+use_wildcard = (len(allowed_origins) == 1 and allowed_origins[0] == "*")
+
+cors_kwargs = dict(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if use_wildcard:
+    # ✅ works for public API without cookies/auth
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,  # MUST be False with "*"
+        **cors_kwargs,
+    )
+else:
+    # ✅ strict allowlist (recommended for production)
+    # You may still use allow_origin_regex for preview domains
+    mw_kwargs = dict(
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        **cors_kwargs,
+    )
+    if allowed_origin_regex:
+        mw_kwargs["allow_origin_regex"] = allowed_origin_regex
+
+    app.add_middleware(CORSMiddleware, **mw_kwargs)
 
 # -----------------------------
 # DB ENV (Render)
@@ -125,7 +159,6 @@ def _service_ids_for_date(conn, d: date) -> List[str]:
         cur.execute(base_sql, (ymd, ymd))
         base = {r["service_id"] for r in cur.fetchall()}
 
-        # calendar_dates may not exist in some GTFS feeds
         try:
             cur.execute(ex_sql, (ymd,))
             ex = cur.fetchall()
@@ -163,15 +196,6 @@ def autocomplete_stops(
     radius_m: int = Query(30000, ge=500, le=200000, description="Search radius in meters (when lat/lon provided)"),
     limit: int = Query(10, ge=1, le=30, description="Max results"),
 ):
-    """
-    Autocomplete stops from gtfs.stops_search.
-
-    Requires table:
-      gtfs.stops_search(stop_id, stop_name, lat, lon, geom)
-
-    - If lat/lon provided -> filter by radius + order by distance
-    - Else -> order by trigram similarity (pg_trgm recommended)
-    """
     q = q.strip()
     if not q:
         return {"query": q, "count": 0, "items": []}
@@ -243,10 +267,6 @@ def nearby_stops(
     radius_m: int = Query(1000, ge=100, le=20000, description="Search radius (meters)"),
     limit: int = Query(20, ge=1, le=50, description="Max results"),
 ):
-    """
-    Find nearby stops within radius (meters), ordered by distance.
-    Uses gtfs.stops_search.geom (EPSG:4326).
-    """
     sql = """
     SELECT
       stop_id,
@@ -289,7 +309,7 @@ def nearby_stops(
 
 
 # -----------------------------
-# Routes for Stop
+# Routes for Stop (FIXED: robust if agency_id missing)
 # -----------------------------
 @app.get("/api/stops/{stop_id}/routes")
 def routes_for_stop(
@@ -299,8 +319,11 @@ def routes_for_stop(
     """
     Return routes that serve a given stop_id.
     Join: stop_times -> trips -> routes
+    Robust:
+      - Some feeds may not have routes.agency_id
+      - We'll try with agency_id first; if UndefinedColumn, retry without it.
     """
-    sql = """
+    sql_with_agency = """
     SELECT DISTINCT
       r.route_id,
       r.route_short_name,
@@ -317,10 +340,34 @@ def routes_for_stop(
       r.route_id
     LIMIT %s;
     """
+
+    sql_no_agency = """
+    SELECT DISTINCT
+      r.route_id,
+      r.route_short_name,
+      r.route_long_name,
+      r.route_type,
+      NULL::text AS agency_id
+    FROM gtfs.stop_times st
+    JOIN gtfs.trips t  ON t.trip_id = st.trip_id
+    JOIN gtfs.routes r ON r.route_id = t.route_id
+    WHERE st.stop_id = %s
+    ORDER BY
+      r.route_type,
+      COALESCE(r.route_short_name, r.route_id),
+      r.route_id
+    LIMIT %s;
+    """
+
     with get_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, (stop_id, limit))
-            rows = cur.fetchall()
+            try:
+                cur.execute(sql_with_agency, (stop_id, limit))
+                rows = cur.fetchall()
+            except psycopg2.errors.UndefinedColumn:
+                conn.rollback()
+                cur.execute(sql_no_agency, (stop_id, limit))
+                rows = cur.fetchall()
 
     items = [
         {
@@ -347,12 +394,6 @@ def next_trips(
     days_ahead: int = Query(7, ge=1, le=30, description="How many days ahead to search if today has no trips"),
     tz: str = Query("Asia/Bangkok", description="Timezone for time comparison"),
 ):
-    """
-    Find next departures for a stop.
-    - If no departures left today -> automatically search next service day (up to days_ahead).
-    - Uses gtfs.calendar (+ gtfs.calendar_dates if exists).
-    - Stable time parsing supports HH>=24 for departure/arrival dt formatting.
-    """
     stop_id = stop_id.strip()
     if not stop_id:
         raise HTTPException(status_code=400, detail="stop_id is required")
@@ -464,7 +505,7 @@ def next_trips(
                             "route_short_name": r["route_short_name"],
                             "route_long_name": r["route_long_name"],
                             "route_type": r["route_type"],
-                            "agency_id": r["agency_id"],
+                            "agency_id": r.get("agency_id"),
                         }
                     )
 
@@ -490,11 +531,6 @@ def route_shape(
     route_id: str,
     direction_id: Optional[int] = Query(None, description="0 or 1 (optional)"),
 ):
-    """
-    Return route geometry as GeoJSON (LineString).
-    Improved: choose representative shape_id (most common) for this route (and direction).
-    Requires: gtfs.trips(shape_id) + gtfs.shape_lines(shape_id, geom)
-    """
     pick_sql = """
     SELECT
       t.shape_id,
@@ -560,10 +596,6 @@ def route_shape(
 # -----------------------------
 @app.get("/api/trips/{trip_id}/stops")
 def trip_stops(trip_id: str):
-    """
-    Stop sequence for a trip (ordered).
-    Returns stop_id, stop_name, lat/lon, arrival_time, departure_time, stop_sequence.
-    """
     sql = """
     SELECT
       st.stop_sequence,
@@ -594,10 +626,6 @@ def route_stops(
     route_id: str,
     direction_id: Optional[int] = Query(None, description="0 or 1 (optional)"),
 ):
-    """
-    Stops along a route by picking a representative trip (the one with most stop_times).
-    Returns representative_trip_id + its ordered stops.
-    """
     trip_sql = """
     SELECT t.trip_id
     FROM gtfs.trips t
@@ -657,10 +685,6 @@ def route_stops(
 # -----------------------------
 @app.get("/api/network/coverage")
 def network_coverage():
-    """
-    Coverage for whole GTFS dataset using stops extent.
-    Returns bbox (minLon,minLat,maxLon,maxLat) + stop_count.
-    """
     sql = """
     SELECT
       COUNT(*)::bigint AS stop_count,
@@ -693,10 +717,6 @@ def route_plan(
     tz: str = Query("Asia/Bangkok"),
     limit: int = Query(3, ge=1, le=10),
 ):
-    """
-    Direct trips only (origin -> destination on same trip, correct order).
-    Uses calendar + calendar_dates via _service_ids_for_date().
-    """
     try:
         z = ZoneInfo(tz)
     except Exception:
@@ -768,7 +788,6 @@ def route_plan(
             cur.execute(sql, (origin_stop_id, dest_stop_id, service_ids, depart_time_str, limit))
             rows = cur.fetchall()
 
-    # Add parsed datetimes (supports 24+)
     items = []
     for r in rows:
         dep_dt = gtfs_time_to_dt(service_day, r["depart_time"], z)
@@ -803,17 +822,6 @@ def route_plan_one_transfer(
     tz: str = Query("Asia/Bangkok"),
     limit: int = Query(3, ge=1, le=10),
 ):
-    """
-    MVP planner: walk + up to 1 transfer.
-    - Find nearby origin stops within walk_radius_m
-    - Find nearby destination stops within walk_radius_m
-    - Search (1) direct O->D, (2) 1-transfer O->X->D with time constraint
-
-    Notes:
-      - Direct leg uses service_ids (calendar + calendar_dates)
-      - Transfer time check uses a simple filter + python buffer minutes (MVP)
-      - For full time-dependent routing (Dijkstra), we can extend later.
-    """
     try:
         z = ZoneInfo(tz)
     except Exception:
@@ -932,13 +940,8 @@ def route_plan_one_transfer(
     with get_conn() as conn:
         service_ids = _service_ids_for_date(conn, service_day)
         if not service_ids:
-            return {
-                "count": 0,
-                "items": [],
-                "note": "No active service_ids for this date (calendar/calendar_dates).",
-            }
+            return {"count": 0, "items": [], "note": "No active service_ids for this date (calendar/calendar_dates)."}
 
-        # Nearby stops
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(nearby_sql, (origin_lon, origin_lat, origin_lon, origin_lat, walk_radius_m))
             O = [r["stop_id"] for r in cur.fetchall()]
@@ -958,7 +961,6 @@ def route_plan_one_transfer(
         items: List[Dict[str, Any]] = []
 
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Direct
             cur.execute(direct_sql, (O, service_ids, depart_time_str, D, limit))
             direct_rows = cur.fetchall()
             for r in direct_rows:
@@ -981,11 +983,10 @@ def route_plan_one_transfer(
                         "route_short_name": r["route_short_name"],
                         "route_long_name": r["route_long_name"],
                         "route_type": r["route_type"],
-                        "agency_id": r["agency_id"],
+                        "agency_id": r.get("agency_id"),
                     }
                 )
 
-            # 1 transfer (MVP)
             cur.execute(one_xfer_sql, (O, service_ids, depart_time_str, service_ids, D, limit))
             x_rows = cur.fetchall()
 
@@ -995,7 +996,6 @@ def route_plan_one_transfer(
                 dep2 = gtfs_time_to_dt(service_day, r["x_dep2"], z)
                 arr2 = gtfs_time_to_dt(service_day, r["d_arr2"], z)
 
-                # Apply transfer buffer minutes in Python
                 if dep2 < (arr1 + timedelta(minutes=transfer_wait_min)):
                     continue
 
