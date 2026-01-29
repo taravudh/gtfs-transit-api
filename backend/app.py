@@ -3,15 +3,13 @@ from typing import Optional
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="GTFS Transit API", version="1.0")
 
 # --- CORS (ให้ Bolt.new เรียกได้) ---
-# ตั้ง ALLOWED_ORIGINS เป็นโดเมน frontend ของคุณภายหลังจะปลอดภัยกว่า
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[o.strip() for o in ALLOWED_ORIGINS if o.strip()],
@@ -26,21 +24,24 @@ DBPORT = int(os.getenv("DBPORT", "5432"))
 DBNAME = os.getenv("DBNAME")
 DBUSER = os.getenv("DBUSER")
 DBPASS = os.getenv("DBPASS")
-
-if not all([DBHOST, DBNAME, DBUSER, DBPASS]):
-    # ไม่ raise ตอน import เพื่อให้ deploy ผ่านได้ แต่จะ error ตอนเรียก endpoint หากยังไม่ตั้ง env
-    pass
+PGSSLMODE = os.getenv("PGSSLMODE", "require")
 
 
 def get_conn():
-    # Render Postgres มักต้อง SSL
+    # ช่วยให้ error อ่านง่าย หากตั้ง env ยังไม่ครบ
+    if not all([DBHOST, DBNAME, DBUSER, DBPASS]):
+        raise HTTPException(
+            status_code=500,
+            detail="DB env not set. Please set DBHOST, DBNAME, DBUSER, DBPASS (and optional DBPORT, PGSSLMODE) in Render.",
+        )
+
     return psycopg2.connect(
         host=DBHOST,
         port=DBPORT,
         dbname=DBNAME,
         user=DBUSER,
         password=DBPASS,
-        sslmode=os.getenv("PGSSLMODE", "require"),
+        sslmode=PGSSLMODE,  # Render Postgres มัก require
     )
 
 
@@ -49,6 +50,7 @@ def health():
     return {"ok": True}
 
 
+# --- (A) endpoint หลัก (ตามของเดิม) ---
 @app.get("/api/stops/autocomplete")
 def autocomplete_stops(
     q: str = Query(..., min_length=1, description="Search text (Thai/English)"),
@@ -64,9 +66,9 @@ def autocomplete_stops(
       gtfs.stops_search(stop_id, stop_name, lat, lon, geom)
 
     - If lat/lon provided -> filter by radius + order by distance
-    - Else -> order by trigram similarity
+    - Else -> order by trigram similarity (pg_trgm)
     """
-    q = q.strip()
+    q = (q or "").strip()
     if not q:
         return {"query": q, "count": 0, "items": []}
 
@@ -95,7 +97,6 @@ def autocomplete_stops(
         """
         params = (lon, lat, q, lon, lat, radius_m, limit)
     else:
-        # ต้องมี pg_trgm และ index trigram จะเร็วมาก
         sql = """
         SELECT
           stop_id,
@@ -110,12 +111,15 @@ def autocomplete_stops(
         """
         params = (q, q, limit)
 
-    with get_conn() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
-            rows = cur.fetchall()
+    try:
+        with get_conn() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+    except psycopg2.Error as e:
+        # ให้ข้อความ error สั้น ๆ (จะเห็นรายละเอียดใน Render logs อยู่แล้ว)
+        raise HTTPException(status_code=500, detail=f"DB query failed: {e.pgerror or str(e)}")
 
-    # normalize output
     items = []
     for r in rows:
         items.append(
@@ -129,3 +133,15 @@ def autocomplete_stops(
         )
 
     return {"query": q, "count": len(items), "items": items}
+
+
+# --- (B) endpoint alias: ให้ Bolt.new เรียกสั้น ๆ ได้ ---
+@app.get("/stops/autocomplete")
+def autocomplete_stops_alias(
+    q: str = Query(..., min_length=1),
+    lat: Optional[float] = Query(None),
+    lon: Optional[float] = Query(None),
+    radius_m: int = Query(30000, ge=500, le=200000),
+    limit: int = Query(10, ge=1, le=30),
+):
+    return autocomplete_stops(q=q, lat=lat, lon=lon, radius_m=radius_m, limit=limit)
