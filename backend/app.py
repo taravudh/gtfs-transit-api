@@ -394,3 +394,52 @@ def nearby_stops(
         "items": items,
     }
 
+@app.get("/api/stops/{stop_id}/routes")
+def routes_for_stop(
+    stop_id: str,
+    limit: int = Query(50, ge=1, le=200, description="Max routes returned"),
+):
+    """
+    Return routes that serve a given stop_id.
+
+    Joins:
+      stop_times -> trips -> routes
+    Optional: include agency_id from routes (already in gtfs.routes)
+    """
+    sql = """
+    SELECT DISTINCT
+      r.route_id,
+      r.route_short_name,
+      r.route_long_name,
+      r.route_type,
+      r.agency_id
+    FROM gtfs.stop_times st
+    JOIN gtfs.trips t  ON t.trip_id = st.trip_id
+    JOIN gtfs.routes r ON r.route_id = t.route_id
+    WHERE st.stop_id = %s
+    ORDER BY
+      r.route_type,
+      COALESCE(r.route_short_name, r.route_id),
+      r.route_id
+    LIMIT %s;
+    """
+    params = (stop_id, limit)
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "route_id": r["route_id"],
+                "route_short_name": r["route_short_name"],
+                "route_long_name": r["route_long_name"],
+                "route_type": r["route_type"],
+                "agency_id": r["agency_id"],
+            }
+        )
+
+    return {"stop_id": stop_id, "count": len(items), "items": items}
