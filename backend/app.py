@@ -443,3 +443,67 @@ def routes_for_stop(
         )
 
     return {"stop_id": stop_id, "count": len(items), "items": items}
+
+from fastapi.responses import JSONResponse
+
+@app.get("/api/routes/{route_id}/shape")
+def route_shape(
+    route_id: str,
+    direction_id: Optional[int] = Query(None, description="0 or 1 (optional)"),
+):
+    """
+    Return route geometry as GeoJSON (LineString).
+
+    Logic:
+      routes -> trips -> shape_id -> shape_lines.geom
+
+    Uses gtfs.shape_lines( shape_id, geom )
+    """
+
+    sql = """
+    SELECT
+      sl.shape_id,
+      ST_AsGeoJSON(sl.geom)::json AS geojson
+    FROM gtfs.trips t
+    JOIN gtfs.shape_lines sl ON sl.shape_id = t.shape_id
+    WHERE t.route_id = %s
+    """
+
+    params = [route_id]
+
+    if direction_id is not None:
+        sql += " AND t.direction_id = %s"
+        params.append(direction_id)
+
+    sql += """
+    ORDER BY t.shape_id
+    LIMIT 1;
+    """
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+
+    if not row:
+        return JSONResponse(
+            status_code=404,
+            content={
+                "route_id": route_id,
+                "direction_id": direction_id,
+                "error": "shape not found",
+            },
+        )
+
+    return {
+        "route_id": route_id,
+        "direction_id": direction_id,
+        "shape_id": row["shape_id"],
+        "type": "Feature",
+        "geometry": row["geojson"],
+        "properties": {
+            "route_id": route_id,
+            "direction_id": direction_id,
+        },
+    }
+
