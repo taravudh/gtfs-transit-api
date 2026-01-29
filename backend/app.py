@@ -149,3 +149,57 @@ def autocomplete_stops_alias(
 @app.get("/")
 def root():
     return {"service": "GTFS Transit API", "status": "ok", "docs": "/docs"}
+
+from fastapi import HTTPException
+
+@app.get("/api/routes/for_stop")
+def routes_for_stop(
+    stop_id: str = Query(..., min_length=1, description="GTFS stop_id"),
+    limit: int = Query(50, ge=1, le=500, description="Max routes returned"),
+):
+    """
+    List routes that serve a given stop_id.
+
+    Requires GTFS tables:
+      - gtfs.stop_times(stop_id, trip_id, ...)
+      - gtfs.trips(trip_id, route_id, ...)
+      - gtfs.routes(route_id, route_short_name, route_long_name, route_type, agency_id, ...)
+    """
+    stop_id = stop_id.strip()
+    if not stop_id:
+        raise HTTPException(status_code=400, detail="stop_id is required")
+
+    sql = """
+    SELECT DISTINCT
+      r.route_id,
+      COALESCE(NULLIF(r.route_short_name,''), r.route_id) AS route_short_name,
+      r.route_long_name,
+      r.route_type,
+      r.agency_id
+    FROM gtfs.stop_times st
+    JOIN gtfs.trips t  ON t.trip_id = st.trip_id
+    JOIN gtfs.routes r ON r.route_id = t.route_id
+    WHERE st.stop_id = %s
+    ORDER BY route_short_name, r.route_long_name NULLS LAST
+    LIMIT %s;
+    """
+    params = (stop_id, limit)
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "route_id": r["route_id"],
+                "route_short_name": r["route_short_name"],
+                "route_long_name": r["route_long_name"],
+                "route_type": r["route_type"],
+                "agency_id": r["agency_id"],
+            }
+        )
+
+    return {"stop_id": stop_id, "count": len(items), "items": items}
