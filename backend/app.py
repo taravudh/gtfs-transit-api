@@ -145,3 +145,7 @@ def autocomplete_stops_alias(
     limit: int = Query(10, ge=1, le=30),
 ):
     return autocomplete_stops(q=q, lat=lat, lon=lon, radius_m=radius_m, limit=limit)
+
+@app.get("/")
+def root():
+    return {"service": "GTFS Transit API", "status": "ok", "docs": "/docs"}
