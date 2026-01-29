@@ -29,30 +29,36 @@ logger = logging.getLogger("gtfs-api")
 app = FastAPI(title="GTFS Transit API", version="1.3")
 
 # -----------------------------
-# CORS (UPDATED)
+# CORS (RECOMMENDED)
 # -----------------------------
-def _split_env_csv(name: str, default: str = "") -> List[str]:
-    raw = os.getenv(name, default) or ""
+def _split_env_csv(name: str) -> List[str]:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return []
     return [x.strip() for x in raw.split(",") if x.strip()]
 
-ALLOWED_ORIGINS_LIST = _split_env_csv("ALLOWED_ORIGINS", "")  # e.g. "http://localhost:5173,https://xxx.netlify.app"
-ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX", "") or "").strip()  # e.g. r"^https://.*\.netlify\.app$"
+ALLOWED_ORIGINS_LIST = _split_env_csv("ALLOWED_ORIGINS")
+ALLOWED_ORIGIN_REGEX = (os.getenv("ALLOWED_ORIGIN_REGEX", "") or "").strip() or None
 
-# If nothing set, default to "*" (dev-friendly)
+# IMPORTANT:
+# - ถ้ามีการตั้งค่า origin แบบเจาะจง (list หรือ regex) => ห้าม fallback เป็น "*"
+# - ถ้าไม่ได้ตั้งอะไรเลย ค่อยใช้ "*" สำหรับ dev
 if not ALLOWED_ORIGINS_LIST and not ALLOWED_ORIGIN_REGEX:
     ALLOWED_ORIGINS_LIST = ["*"]
-
-# CORS credentials note:
-# If allow_origins is ["*"], browsers don't like allow_credentials=True. We set False in that case.
-allow_credentials = False if (len(ALLOWED_ORIGINS_LIST) == 1 and ALLOWED_ORIGINS_LIST[0] == "*") else True
+    allow_credentials = False
+else:
+    # เมื่อไม่ใช้ "*" ให้เปิด credentials ได้ (รองรับ cookie/authorization ถ้าต้องใช้ในอนาคต)
+    allow_credentials = True
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS_LIST,
-    allow_origin_regex=ALLOWED_ORIGIN_REGEX or None,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
     allow_credentials=allow_credentials,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    expose_headers=["*"],  # ไม่จำเป็นเสมอ แต่ช่วย debug/อ่าน header บางตัวได้
+    max_age=86400,         # ทำให้ browser cache preflight 1 วัน ลดปัญหาจุกจิก
 )
 
 @app.get("/api/debug/cors")
@@ -62,6 +68,7 @@ def debug_cors():
         "ALLOWED_ORIGIN_REGEX": ALLOWED_ORIGIN_REGEX,
         "allow_credentials": allow_credentials,
     }
+
 
 # -----------------------------
 # Global exception handler (UPDATED)
