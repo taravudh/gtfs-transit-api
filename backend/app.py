@@ -331,3 +331,66 @@ def next_trips(
         "count": 0,
         "items": [],
     }
+
+from math import radians, cos
+
+@app.get("/api/stops/nearby")
+def nearby_stops(
+    lat: float = Query(..., ge=-90, le=90, description="User latitude"),
+    lon: float = Query(..., ge=-180, le=180, description="User longitude"),
+    radius_m: int = Query(1000, ge=100, le=20000, description="Search radius (meters)"),
+    limit: int = Query(20, ge=1, le=50, description="Max results"),
+):
+    """
+    Find nearby stops within radius (meters), ordered by distance.
+
+    Uses gtfs.stops_search.geom (EPSG:4326).
+    """
+
+    sql = """
+    SELECT
+      stop_id,
+      stop_name AS name,
+      lat,
+      lon,
+      ST_Distance(
+        geom::geography,
+        ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography
+      ) AS dist_m
+    FROM gtfs.stops_search
+    WHERE ST_DWithin(
+      geom::geography,
+      ST_SetSRID(ST_MakePoint(%s, %s), 4326)::geography,
+      %s
+    )
+    ORDER BY dist_m ASC
+    LIMIT %s;
+    """
+
+    params = (lon, lat, lon, lat, radius_m, limit)
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "stop_id": r["stop_id"],
+                "name": r["name"],
+                "lat": float(r["lat"]),
+                "lon": float(r["lon"]),
+                "dist_m": round(float(r["dist_m"]), 1),
+            }
+        )
+
+    return {
+        "lat": lat,
+        "lon": lon,
+        "radius_m": radius_m,
+        "count": len(items),
+        "items": items,
+    }
+
