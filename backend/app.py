@@ -1,3 +1,7 @@
+from datetime import datetime, date, timedelta
+from zoneinfo import ZoneInfo
+from fastapi.responses import JSONResponse
+
 import os
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date, timedelta
@@ -505,5 +509,215 @@ def route_shape(
             "route_id": route_id,
             "direction_id": direction_id,
         },
+    }
+
+@app.get("/api/trips/{trip_id}/stops")
+def trip_stops(trip_id: str):
+    """
+    Stop sequence for a trip (ordered).
+    Returns stop_id, stop_name, lat/lon, arrival_time, departure_time, stop_sequence.
+    """
+    sql = """
+    SELECT
+      st.stop_sequence,
+      st.stop_id,
+      s.stop_name AS stop_name,
+      s.stop_lat::double precision AS lat,
+      s.stop_lon::double precision AS lon,
+      st.arrival_time,
+      st.departure_time
+    FROM gtfs.stop_times st
+    JOIN gtfs.stops s ON s.stop_id = st.stop_id
+    WHERE st.trip_id = %s
+    ORDER BY st.stop_sequence ASC;
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, (trip_id,))
+            rows = cur.fetchall()
+
+    return {"trip_id": trip_id, "count": len(rows), "items": rows}
+
+@app.get("/api/routes/{route_id}/stops")
+def route_stops(
+    route_id: str,
+    direction_id: Optional[int] = Query(None, description="0 or 1 (optional)"),
+):
+    """
+    Stops along a route by picking a representative trip (per direction if provided).
+    Returns representative trip_id + its ordered stops.
+    """
+    # 1) pick representative trip_id (the one with most stop_times)
+    trip_sql = """
+    SELECT t.trip_id
+    FROM gtfs.trips t
+    JOIN gtfs.stop_times st ON st.trip_id = t.trip_id
+    WHERE t.route_id = %s
+    """
+    params = [route_id]
+    if direction_id is not None:
+        trip_sql += " AND t.direction_id = %s"
+        params.append(direction_id)
+
+    trip_sql += """
+    GROUP BY t.trip_id
+    ORDER BY COUNT(*) DESC
+    LIMIT 1;
+    """
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(trip_sql, params)
+            trip = cur.fetchone()
+
+            if not trip:
+                return JSONResponse(
+                    status_code=404,
+                    content={"route_id": route_id, "direction_id": direction_id, "error": "no trip found"},
+                )
+
+            trip_id = trip["trip_id"]
+
+            # 2) get stops for that trip
+            stops_sql = """
+            SELECT
+              st.stop_sequence,
+              st.stop_id,
+              s.stop_name AS stop_name,
+              s.stop_lat::double precision AS lat,
+              s.stop_lon::double precision AS lon
+            FROM gtfs.stop_times st
+            JOIN gtfs.stops s ON s.stop_id = st.stop_id
+            WHERE st.trip_id = %s
+            ORDER BY st.stop_sequence ASC;
+            """
+            cur.execute(stops_sql, (trip_id,))
+            rows = cur.fetchall()
+
+    return {
+        "route_id": route_id,
+        "direction_id": direction_id,
+        "representative_trip_id": trip_id,
+        "count": len(rows),
+        "items": rows,
+    }
+
+@app.get("/api/network/coverage")
+def network_coverage():
+    """
+    Coverage for whole GTFS dataset using stops extent.
+    Returns bbox (minLon,minLat,maxLon,maxLat) + stop_count.
+    """
+    sql = """
+    SELECT
+      COUNT(*)::bigint AS stop_count,
+      MIN(stop_lon)::double precision AS min_lon,
+      MIN(stop_lat)::double precision AS min_lat,
+      MAX(stop_lon)::double precision AS max_lon,
+      MAX(stop_lat)::double precision AS max_lat
+    FROM gtfs.stops
+    WHERE stop_lon IS NOT NULL AND stop_lat IS NOT NULL;
+    """
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql)
+            r = cur.fetchone()
+
+    return {
+        "stop_count": int(r["stop_count"] or 0),
+        "bbox": [r["min_lon"], r["min_lat"], r["max_lon"], r["max_lat"]],
+    }
+@app.get("/api/route/plan")
+def route_plan(
+    origin_stop_id: str = Query(...),
+    dest_stop_id: str = Query(...),
+    depart_dt: Optional[str] = Query(None, description="ISO datetime, e.g. 2026-01-29T08:30:00"),
+    tz: str = Query("Asia/Bangkok"),
+    limit: int = Query(3, ge=1, le=10),
+):
+    """
+    Simple planner (Direct trips only: origin -> destination on same trip in correct order)
+    with basic service filtering using gtfs.calendar (no calendar_dates exceptions yet).
+    """
+    z = ZoneInfo(tz)
+    now = datetime.now(z)
+
+    if depart_dt:
+        try:
+            depart = datetime.fromisoformat(depart_dt)
+            if depart.tzinfo is None:
+                depart = depart.replace(tzinfo=z)
+            else:
+                depart = depart.astimezone(z)
+        except Exception:
+            return JSONResponse(status_code=400, content={"error": "depart_dt must be ISO datetime"})
+    else:
+        depart = now
+
+    # day-of-week field for calendar
+    dow = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"][depart.weekday()]
+    service_date = int(depart.strftime("%Y%m%d"))
+
+    sql = f"""
+    WITH candidates AS (
+      SELECT
+        t.trip_id,
+        t.route_id,
+        t.service_id,
+        t.direction_id,
+        t.trip_headsign,
+        st_o.departure_time AS depart_time,
+        st_d.arrival_time   AS arrive_time,
+        st_o.stop_sequence  AS o_seq,
+        st_d.stop_sequence  AS d_seq
+      FROM gtfs.trips t
+      JOIN gtfs.stop_times st_o ON st_o.trip_id = t.trip_id AND st_o.stop_id = %s
+      JOIN gtfs.stop_times st_d ON st_d.trip_id = t.trip_id AND st_d.stop_id = %s
+      JOIN gtfs.calendar c ON c.service_id = t.service_id
+      WHERE st_d.stop_sequence > st_o.stop_sequence
+        AND c.{dow} = 1
+        AND c.start_date::int <= %s
+        AND c.end_date::int >= %s
+        AND st_o.departure_time >= %s
+    )
+    SELECT
+      c.*,
+      r.route_short_name,
+      r.route_long_name,
+      r.route_type,
+      r.agency_id
+    FROM candidates c
+    JOIN gtfs.routes r ON r.route_id = c.route_id
+    ORDER BY c.depart_time ASC
+    LIMIT %s;
+    """
+
+    # depart_time is time-string "HH:MM:SS"
+    depart_time_str = depart.strftime("%H:%M:%S")
+
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                sql,
+                (
+                    origin_stop_id,
+                    dest_stop_id,
+                    service_date,
+                    service_date,
+                    depart_time_str,
+                    limit,
+                ),
+            )
+            rows = cur.fetchall()
+
+    return {
+        "origin_stop_id": origin_stop_id,
+        "dest_stop_id": dest_stop_id,
+        "tz": tz,
+        "now": now.isoformat(),
+        "depart_dt": depart.isoformat(),
+        "count": len(rows),
+        "items": rows,
+        "note": "direct-only (no transfers yet)",
     }
 
