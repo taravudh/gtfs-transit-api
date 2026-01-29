@@ -297,23 +297,31 @@ def nearby_stops(
 @app.get("/api/stops/{stop_id}/routes")
 def routes_for_stop(
     stop_id: str,
-    limit: int = Query(50, ge=1, le=200),
+    limit: int = Query(50, ge=1, le=200, description="Max routes returned"),
 ):
     sql = """
-    SELECT DISTINCT
-      r.route_id,
-      r.route_short_name,
-      r.route_long_name,
-      r.route_type,
-      r.agency_id
-    FROM gtfs.stop_times st
-    JOIN gtfs.trips t  ON t.trip_id = st.trip_id
-    JOIN gtfs.routes r ON r.route_id = t.route_id
-    WHERE st.stop_id::text = %s
+    SELECT
+      route_id,
+      route_short_name,
+      route_long_name,
+      route_type,
+      agency_id
+    FROM (
+      SELECT DISTINCT
+        r.route_id,
+        r.route_short_name,
+        r.route_long_name,
+        r.route_type,
+        r.agency_id
+      FROM gtfs.stop_times st
+      JOIN gtfs.trips t  ON t.trip_id = st.trip_id
+      JOIN gtfs.routes r ON r.route_id = t.route_id
+      WHERE st.stop_id::text = %s
+    ) x
     ORDER BY
-      r.route_type,
-      COALESCE(r.route_short_name, r.route_id::text),
-      r.route_id
+      x.route_type,
+      COALESCE(x.route_short_name, x.route_id::text),
+      x.route_id
     LIMIT %s;
     """
     with get_conn() as conn:
@@ -332,6 +340,7 @@ def routes_for_stop(
         for r in rows
     ]
     return {"stop_id": stop_id, "count": len(items), "items": items}
+
 
 # -----------------------------
 # Next Trips (stable time parsing + calendar_dates)
