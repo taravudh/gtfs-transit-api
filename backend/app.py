@@ -674,7 +674,7 @@ def network_coverage():
 
 
 # -----------------------------
-# Route Plan (Direct-only, calendar_dates supported)
+# Route Plan (Direct-only, calendar_dates supported) - UPDATED: days_ahead auto-search
 # -----------------------------
 @app.get("/api/route/plan")
 def route_plan(
@@ -683,6 +683,7 @@ def route_plan(
     depart_dt: Optional[str] = Query(None, description="ISO datetime, e.g. 2026-01-29T08:30:00"),
     tz: str = Query("Asia/Bangkok"),
     limit: int = Query(3, ge=1, le=10),
+    days_ahead: int = Query(30, ge=1, le=30, description="Auto-search next service day if no trips on selected day"),
 ):
     try:
         z = ZoneInfo(tz)
@@ -702,10 +703,11 @@ def route_plan(
     else:
         depart = now
 
-    service_day = depart.date()
-    depart_time_str = depart.strftime("%H:%M:%S")
+    base_service_day = depart.date()
+    base_depart_time_str = depart.strftime("%H:%M:%S")
 
-    sql = """
+    # NOTE: time filter will be injected conditionally (day0 uses >= selected time, later days start from 00:00:00)
+    sql_tpl = """
     WITH candidates AS (
       SELECT
         t.trip_id,
@@ -722,7 +724,7 @@ def route_plan(
       JOIN gtfs.stop_times st_d ON st_d.trip_id = t.trip_id AND st_d.stop_id = %s
       WHERE st_d.stop_sequence > st_o.stop_sequence
         AND t.service_id = ANY(%s)
-        AND st_o.departure_time >= %s
+        {time_filter_sql}
     )
     SELECT
       c.*,
@@ -737,8 +739,43 @@ def route_plan(
     """
 
     with get_conn() as conn:
-        service_ids = _service_ids_for_date(conn, service_day)
-        if not service_ids:
+        last_note = ""
+        for i in range(days_ahead):
+            service_day = base_service_day + timedelta(days=i)
+
+            service_ids = _service_ids_for_date(conn, service_day)
+            if not service_ids:
+                last_note = "No active service_ids for this date (calendar/calendar_dates)."
+                continue
+
+            # day0: respect requested depart time; later days: start from midnight
+            if i == 0:
+                time_filter_sql = "AND st_o.departure_time >= %s"
+                time_param = base_depart_time_str
+            else:
+                time_filter_sql = "AND st_o.departure_time >= %s"
+                time_param = "00:00:00"
+
+            sql = sql_tpl.format(time_filter_sql=time_filter_sql)
+
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(sql, (origin_stop_id, dest_stop_id, service_ids, time_param, limit))
+                rows = cur.fetchall()
+
+            if not rows:
+                last_note = "No matching trips found for this date/time window."
+                continue
+
+            items = []
+            for r in rows:
+                dep_dt = gtfs_time_to_dt(service_day, r["depart_time"], z)
+                arr_dt = gtfs_time_to_dt(service_day, r["arrive_time"], z)
+                items.append({**r, "depart_dt": dep_dt.isoformat(), "arrive_dt": arr_dt.isoformat()})
+
+            note = "direct-only (no transfers yet), calendar_dates supported"
+            if i > 0:
+                note += f" | auto-shifted to next service day (+{i}d)"
+
             return {
                 "origin_stop_id": origin_stop_id,
                 "dest_stop_id": dest_stop_id,
@@ -746,36 +783,29 @@ def route_plan(
                 "now": now.isoformat(),
                 "depart_dt": depart.isoformat(),
                 "service_date": service_day.isoformat(),
-                "count": 0,
-                "items": [],
-                "note": "No active service_ids for this date (calendar/calendar_dates).",
+                "searched_days": i + 1,
+                "count": len(items),
+                "items": items,
+                "note": note,
             }
 
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, (origin_stop_id, dest_stop_id, service_ids, depart_time_str, limit))
-            rows = cur.fetchall()
-
-    items = []
-    for r in rows:
-        dep_dt = gtfs_time_to_dt(service_day, r["depart_time"], z)
-        arr_dt = gtfs_time_to_dt(service_day, r["arrive_time"], z)
-        items.append({**r, "depart_dt": dep_dt.isoformat(), "arrive_dt": arr_dt.isoformat()})
-
+    # nothing found within days_ahead
     return {
         "origin_stop_id": origin_stop_id,
         "dest_stop_id": dest_stop_id,
         "tz": tz,
         "now": now.isoformat(),
         "depart_dt": depart.isoformat(),
-        "service_date": service_day.isoformat(),
-        "count": len(items),
-        "items": items,
-        "note": "direct-only (no transfers yet), calendar_dates supported",
+        "service_date": base_service_day.isoformat(),
+        "searched_days": days_ahead,
+        "count": 0,
+        "items": [],
+        "note": f"No routes found within {days_ahead} day(s). Last: {last_note}",
     }
 
 
 # -----------------------------
-# MVP: Walk + 1 Transfer planner
+# MVP: Walk + 1 Transfer planner - UPDATED: days_ahead auto-search
 # -----------------------------
 @app.get("/api/route/plan1x")
 def route_plan_one_transfer(
@@ -788,6 +818,7 @@ def route_plan_one_transfer(
     depart_dt: Optional[str] = Query(None, description="ISO datetime, e.g. 2026-01-29T08:30:00"),
     tz: str = Query("Asia/Bangkok"),
     limit: int = Query(3, ge=1, le=10),
+    days_ahead: int = Query(30, ge=1, le=30, description="Auto-search next service day if no trips on selected day"),
 ):
     try:
         z = ZoneInfo(tz)
@@ -807,8 +838,8 @@ def route_plan_one_transfer(
     else:
         depart = now
 
-    service_day = depart.date()
-    depart_time_str = depart.strftime("%H:%M:%S")
+    base_service_day = depart.date()
+    base_depart_time_str = depart.strftime("%H:%M:%S")
 
     nearby_sql = """
     SELECT stop_id,
@@ -826,7 +857,7 @@ def route_plan_one_transfer(
     LIMIT 50;
     """
 
-    direct_sql = """
+    direct_sql_tpl = """
     WITH o AS (
       SELECT st.trip_id, st.stop_id AS o_stop, st.stop_sequence AS o_seq, st.departure_time AS o_dep
       FROM gtfs.stop_times st
@@ -852,7 +883,7 @@ def route_plan_one_transfer(
     LIMIT %s;
     """
 
-    one_xfer_sql = """
+    one_xfer_sql_tpl = """
     WITH leg1 AS (
       SELECT
         st1.trip_id AS trip1,
@@ -905,10 +936,7 @@ def route_plan_one_transfer(
     """
 
     with get_conn() as conn:
-        service_ids = _service_ids_for_date(conn, service_day)
-        if not service_ids:
-            return {"count": 0, "items": [], "note": "No active service_ids for this date (calendar/calendar_dates)."}
-
+        # nearby stops are independent from service day -> compute once
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(nearby_sql, (origin_lon, origin_lat, origin_lon, origin_lat, walk_radius_m))
             O = [r["stop_id"] for r in cur.fetchall()]
@@ -925,98 +953,138 @@ def route_plan_one_transfer(
                 "dest_nearby_count": len(D),
             }
 
-        items: List[Dict[str, Any]] = []
+        last_note = ""
+        for i in range(days_ahead):
+            service_day = base_service_day + timedelta(days=i)
 
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(direct_sql, (O, service_ids, depart_time_str, D, limit))
-            direct_rows = cur.fetchall()
-            for r in direct_rows:
-                dep_dt = gtfs_time_to_dt(service_day, r["o_dep"], z)
-                arr_dt = gtfs_time_to_dt(service_day, r["d_arr"], z)
-                items.append(
-                    {
-                        "type": "direct",
-                        "trip_id": r["trip_id"],
-                        "route_id": r["route_id"],
-                        "direction_id": r["direction_id"],
-                        "trip_headsign": r["trip_headsign"],
-                        "service_id": r["service_id"],
-                        "origin_stop_id": r["o_stop"],
-                        "dest_stop_id": r["d_stop"],
-                        "depart_time": r["o_dep"],
-                        "arrive_time": r["d_arr"],
-                        "depart_dt": dep_dt.isoformat(),
-                        "arrive_dt": arr_dt.isoformat(),
-                        "route_short_name": r["route_short_name"],
-                        "route_long_name": r["route_long_name"],
-                        "route_type": r["route_type"],
-                        "agency_id": r.get("agency_id"),
-                    }
-                )
+            service_ids = _service_ids_for_date(conn, service_day)
+            if not service_ids:
+                last_note = "No active service_ids for this date (calendar/calendar_dates)."
+                continue
 
-            cur.execute(one_xfer_sql, (O, service_ids, depart_time_str, service_ids, D, limit))
-            x_rows = cur.fetchall()
+            # day0 respect requested time; later days start from midnight
+            time_str = base_depart_time_str if i == 0 else "00:00:00"
 
-            for r in x_rows:
-                dep1 = gtfs_time_to_dt(service_day, r["o_dep"], z)
-                arr1 = gtfs_time_to_dt(service_day, r["x_arr"], z)
-                dep2 = gtfs_time_to_dt(service_day, r["x_dep2"], z)
-                arr2 = gtfs_time_to_dt(service_day, r["d_arr2"], z)
+            items: List[Dict[str, Any]] = []
 
-                if dep2 < (arr1 + timedelta(minutes=transfer_wait_min)):
-                    continue
-
-                items.append(
-                    {
-                        "type": "1-transfer",
-                        "origin_stop_id": r["o_stop"],
-                        "transfer_stop_id": r["x_stop"],
-                        "dest_stop_id": r["d_stop"],
-                        "leg1": {
-                            "trip_id": r["trip1"],
-                            "route_id": r["route1"],
-                            "direction_id": r["dir1"],
-                            "trip_headsign": r["head1"],
-                            "service_id": r["sid1"],
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # direct
+                cur.execute(direct_sql_tpl, (O, service_ids, time_str, D, limit))
+                direct_rows = cur.fetchall()
+                for r in direct_rows:
+                    dep_dt = gtfs_time_to_dt(service_day, r["o_dep"], z)
+                    arr_dt = gtfs_time_to_dt(service_day, r["d_arr"], z)
+                    items.append(
+                        {
+                            "type": "direct",
+                            "trip_id": r["trip_id"],
+                            "route_id": r["route_id"],
+                            "direction_id": r["direction_id"],
+                            "trip_headsign": r["trip_headsign"],
+                            "service_id": r["service_id"],
+                            "origin_stop_id": r["o_stop"],
+                            "dest_stop_id": r["d_stop"],
                             "depart_time": r["o_dep"],
-                            "arrive_time": r["x_arr"],
-                            "depart_dt": dep1.isoformat(),
-                            "arrive_dt": arr1.isoformat(),
-                            "route_short_name": r["r1_short"],
-                            "route_long_name": r["r1_long"],
-                            "route_type": r["r1_type"],
-                            "agency_id": r["r1_agency"],
-                        },
-                        "leg2": {
-                            "trip_id": r["trip2"],
-                            "route_id": r["route2"],
-                            "direction_id": r["dir2"],
-                            "trip_headsign": r["head2"],
-                            "service_id": r["sid2"],
-                            "depart_time": r["x_dep2"],
-                            "arrive_time": r["d_arr2"],
-                            "depart_dt": dep2.isoformat(),
-                            "arrive_dt": arr2.isoformat(),
-                            "route_short_name": r["r2_short"],
-                            "route_long_name": r["r2_long"],
-                            "route_type": r["r2_type"],
-                            "agency_id": r["r2_agency"],
-                        },
-                    }
-                )
+                            "arrive_time": r["d_arr"],
+                            "depart_dt": dep_dt.isoformat(),
+                            "arrive_dt": arr_dt.isoformat(),
+                            "route_short_name": r["route_short_name"],
+                            "route_long_name": r["route_long_name"],
+                            "route_type": r["route_type"],
+                            "agency_id": r.get("agency_id"),
+                        }
+                    )
+
+                # 1-transfer
+                cur.execute(one_xfer_sql_tpl, (O, service_ids, time_str, service_ids, D, limit))
+                x_rows = cur.fetchall()
+
+                for r in x_rows:
+                    dep1 = gtfs_time_to_dt(service_day, r["o_dep"], z)
+                    arr1 = gtfs_time_to_dt(service_day, r["x_arr"], z)
+                    dep2 = gtfs_time_to_dt(service_day, r["x_dep2"], z)
+                    arr2 = gtfs_time_to_dt(service_day, r["d_arr2"], z)
+
+                    if dep2 < (arr1 + timedelta(minutes=transfer_wait_min)):
+                        continue
+
+                    items.append(
+                        {
+                            "type": "1-transfer",
+                            "origin_stop_id": r["o_stop"],
+                            "transfer_stop_id": r["x_stop"],
+                            "dest_stop_id": r["d_stop"],
+                            "leg1": {
+                                "trip_id": r["trip1"],
+                                "route_id": r["route1"],
+                                "direction_id": r["dir1"],
+                                "trip_headsign": r["head1"],
+                                "service_id": r["sid1"],
+                                "depart_time": r["o_dep"],
+                                "arrive_time": r["x_arr"],
+                                "depart_dt": dep1.isoformat(),
+                                "arrive_dt": arr1.isoformat(),
+                                "route_short_name": r["r1_short"],
+                                "route_long_name": r["r1_long"],
+                                "route_type": r["r1_type"],
+                                "agency_id": r["r1_agency"],
+                            },
+                            "leg2": {
+                                "trip_id": r["trip2"],
+                                "route_id": r["route2"],
+                                "direction_id": r["dir2"],
+                                "trip_headsign": r["head2"],
+                                "service_id": r["sid2"],
+                                "depart_time": r["x_dep2"],
+                                "arrive_time": r["d_arr2"],
+                                "depart_dt": dep2.isoformat(),
+                                "arrive_dt": arr2.isoformat(),
+                                "route_short_name": r["r2_short"],
+                                "route_long_name": r["r2_long"],
+                                "route_type": r["r2_type"],
+                                "agency_id": r["r2_agency"],
+                            },
+                        }
+                    )
+
+            if items:
+                note = "MVP: direct + up to 1 transfer (full time-dependent routing can be added later)"
+                if i > 0:
+                    note += f" | auto-shifted to next service day (+{i}d)"
+
+                return {
+                    "tz": tz,
+                    "now": now.isoformat(),
+                    "depart_dt": depart.isoformat(),
+                    "service_date": service_day.isoformat(),
+                    "searched_days": i + 1,
+                    "origin": {"lat": origin_lat, "lon": origin_lon},
+                    "destination": {"lat": dest_lat, "lon": dest_lon},
+                    "walk_radius_m": walk_radius_m,
+                    "transfer_wait_min": transfer_wait_min,
+                    "origin_nearby_count": len(O),
+                    "dest_nearby_count": len(D),
+                    "count": len(items[:limit]),
+                    "items": items[:limit],
+                    "note": note,
+                }
+
+            last_note = "No matching trips found for this date/time window."
 
     return {
         "tz": tz,
         "now": now.isoformat(),
         "depart_dt": depart.isoformat(),
-        "service_date": service_day.isoformat(),
+        "service_date": base_service_day.isoformat(),
+        "searched_days": days_ahead,
         "origin": {"lat": origin_lat, "lon": origin_lon},
         "destination": {"lat": dest_lat, "lon": dest_lon},
         "walk_radius_m": walk_radius_m,
         "transfer_wait_min": transfer_wait_min,
         "origin_nearby_count": len(O),
         "dest_nearby_count": len(D),
-        "count": len(items[:limit]),
-        "items": items[:limit],
-        "note": "MVP: direct + up to 1 transfer (full time-dependent routing can be added later)",
+        "count": 0,
+        "items": [],
+        "note": f"No routes found within {days_ahead} day(s). Last: {last_note}",
     }
+
