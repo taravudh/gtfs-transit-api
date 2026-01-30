@@ -805,16 +805,22 @@ def route_plan(
 
 
 # -----------------------------
-# MVP: Walk + 1 Transfer planner - UPDATED: days_ahead auto-search
+# MVP: Walk + 1 Transfer planner - FIXED: no duplicate WHERE + optional filters
 # -----------------------------
 @app.get("/api/route/plan1x")
 def route_plan_one_transfer(
-    origin_lat: float = Query(...),
-    origin_lon: float = Query(...),
-    dest_lat: float = Query(...),
-    dest_lon: float = Query(...),
+    origin_lat: float = Query(..., ge=-90, le=90),
+    origin_lon: float = Query(..., ge=-180, le=180),
+    dest_lat: float = Query(..., ge=-90, le=90),
+    dest_lon: float = Query(..., ge=-180, le=180),
+
     walk_radius_m: int = Query(800, ge=100, le=5000),
     transfer_wait_min: int = Query(5, ge=0, le=60),
+
+    # Optional: filter เครือข่าย/หน่วยงาน (กันบัสมั่วๆ โผล่มา)
+    route_type: Optional[List[int]] = Query(None, description="Filter by route_type list, e.g. 0 for rail, 3 for bus"),
+    agency_id: Optional[List[str]] = Query(None, description="Filter by agency_id list, e.g. BTSC,BMTA"),
+
     depart_dt: Optional[str] = Query(None, description="ISO datetime, e.g. 2026-01-29T08:30:00"),
     tz: str = Query("Asia/Bangkok"),
     limit: int = Query(3, ge=1, le=10),
@@ -857,7 +863,25 @@ def route_plan_one_transfer(
     LIMIT 50;
     """
 
-    direct_sql_tpl = """
+    # ---- สร้างเงื่อนไข filter แบบ "AND ..." เท่านั้น (ห้ามสร้าง WHERE ซ้ำ)
+    def _filters_sql(alias_routes: str) -> (str, List[Any]):
+        conds = []
+        params: List[Any] = []
+        if route_type:
+            conds.append(f"{alias_routes}.route_type = ANY(%s)")
+            params.append(route_type)
+        if agency_id:
+            conds.append(f"{alias_routes}.agency_id = ANY(%s)")
+            params.append(agency_id)
+        if not conds:
+            return "", []
+        return " AND " + " AND ".join(conds), params
+
+    direct_filter_sql, direct_filter_params = _filters_sql("r")
+    r1_filter_sql, r1_filter_params = _filters_sql("r1")
+    r2_filter_sql, r2_filter_params = _filters_sql("r2")
+
+    direct_sql = f"""
     WITH o AS (
       SELECT st.trip_id, st.stop_id AS o_stop, st.stop_sequence AS o_seq, st.departure_time AS o_dep
       FROM gtfs.stop_times st
@@ -879,11 +903,13 @@ def route_plan_one_transfer(
     JOIN d ON d.trip_id = o.trip_id AND d.d_seq > o.o_seq
     JOIN gtfs.trips t ON t.trip_id = o.trip_id
     JOIN gtfs.routes r ON r.route_id = t.route_id
+    WHERE TRUE
+      {direct_filter_sql}
     ORDER BY o.o_dep ASC
     LIMIT %s;
     """
 
-    one_xfer_sql_tpl = """
+    one_xfer_sql = f"""
     WITH leg1 AS (
       SELECT
         st1.trip_id AS trip1,
@@ -931,12 +957,14 @@ def route_plan_one_transfer(
     JOIN gtfs.routes r1 ON r1.route_id = t1.route_id
     JOIN gtfs.routes r2 ON r2.route_id = t2.route_id
     WHERE l2.x_dep2 >= l1.x_arr
+      {r1_filter_sql}
+      {r2_filter_sql}
     ORDER BY l1.o_dep ASC, l2.x_dep2 ASC
     LIMIT %s;
     """
 
     with get_conn() as conn:
-        # nearby stops are independent from service day -> compute once
+        # nearby stops
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(nearby_sql, (origin_lon, origin_lat, origin_lon, origin_lat, walk_radius_m))
             O = [r["stop_id"] for r in cur.fetchall()]
@@ -956,47 +984,50 @@ def route_plan_one_transfer(
         last_note = ""
         for i in range(days_ahead):
             service_day = base_service_day + timedelta(days=i)
-
             service_ids = _service_ids_for_date(conn, service_day)
             if not service_ids:
                 last_note = "No active service_ids for this date (calendar/calendar_dates)."
                 continue
 
-            # day0 respect requested time; later days start from midnight
             time_str = base_depart_time_str if i == 0 else "00:00:00"
-
             items: List[Dict[str, Any]] = []
 
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 # direct
-                cur.execute(direct_sql_tpl, (O, service_ids, time_str, D, limit))
+                params_direct = [O, service_ids, time_str, D]
+                params_direct += direct_filter_params
+                params_direct += [limit]
+                cur.execute(direct_sql, params_direct)
                 direct_rows = cur.fetchall()
+
                 for r in direct_rows:
                     dep_dt = gtfs_time_to_dt(service_day, r["o_dep"], z)
                     arr_dt = gtfs_time_to_dt(service_day, r["d_arr"], z)
-                    items.append(
-                        {
-                            "type": "direct",
-                            "trip_id": r["trip_id"],
-                            "route_id": r["route_id"],
-                            "direction_id": r["direction_id"],
-                            "trip_headsign": r["trip_headsign"],
-                            "service_id": r["service_id"],
-                            "origin_stop_id": r["o_stop"],
-                            "dest_stop_id": r["d_stop"],
-                            "depart_time": r["o_dep"],
-                            "arrive_time": r["d_arr"],
-                            "depart_dt": dep_dt.isoformat(),
-                            "arrive_dt": arr_dt.isoformat(),
-                            "route_short_name": r["route_short_name"],
-                            "route_long_name": r["route_long_name"],
-                            "route_type": r["route_type"],
-                            "agency_id": r.get("agency_id"),
-                        }
-                    )
+                    items.append({
+                        "type": "direct",
+                        "trip_id": r["trip_id"],
+                        "route_id": r["route_id"],
+                        "direction_id": r["direction_id"],
+                        "trip_headsign": r["trip_headsign"],
+                        "service_id": r["service_id"],
+                        "origin_stop_id": r["o_stop"],
+                        "dest_stop_id": r["d_stop"],
+                        "depart_time": r["o_dep"],
+                        "arrive_time": r["d_arr"],
+                        "depart_dt": dep_dt.isoformat(),
+                        "arrive_dt": arr_dt.isoformat(),
+                        "route_short_name": r["route_short_name"],
+                        "route_long_name": r["route_long_name"],
+                        "route_type": r["route_type"],
+                        "agency_id": r.get("agency_id"),
+                    })
 
                 # 1-transfer
-                cur.execute(one_xfer_sql_tpl, (O, service_ids, time_str, service_ids, D, limit))
+                params_x = [O, service_ids, time_str, service_ids, D]
+                params_x += r1_filter_params
+                params_x += r2_filter_params
+                params_x += [limit]
+                cur.execute(one_xfer_sql, params_x)
                 x_rows = cur.fetchall()
 
                 for r in x_rows:
@@ -1008,44 +1039,42 @@ def route_plan_one_transfer(
                     if dep2 < (arr1 + timedelta(minutes=transfer_wait_min)):
                         continue
 
-                    items.append(
-                        {
-                            "type": "1-transfer",
-                            "origin_stop_id": r["o_stop"],
-                            "transfer_stop_id": r["x_stop"],
-                            "dest_stop_id": r["d_stop"],
-                            "leg1": {
-                                "trip_id": r["trip1"],
-                                "route_id": r["route1"],
-                                "direction_id": r["dir1"],
-                                "trip_headsign": r["head1"],
-                                "service_id": r["sid1"],
-                                "depart_time": r["o_dep"],
-                                "arrive_time": r["x_arr"],
-                                "depart_dt": dep1.isoformat(),
-                                "arrive_dt": arr1.isoformat(),
-                                "route_short_name": r["r1_short"],
-                                "route_long_name": r["r1_long"],
-                                "route_type": r["r1_type"],
-                                "agency_id": r["r1_agency"],
-                            },
-                            "leg2": {
-                                "trip_id": r["trip2"],
-                                "route_id": r["route2"],
-                                "direction_id": r["dir2"],
-                                "trip_headsign": r["head2"],
-                                "service_id": r["sid2"],
-                                "depart_time": r["x_dep2"],
-                                "arrive_time": r["d_arr2"],
-                                "depart_dt": dep2.isoformat(),
-                                "arrive_dt": arr2.isoformat(),
-                                "route_short_name": r["r2_short"],
-                                "route_long_name": r["r2_long"],
-                                "route_type": r["r2_type"],
-                                "agency_id": r["r2_agency"],
-                            },
-                        }
-                    )
+                    items.append({
+                        "type": "1-transfer",
+                        "origin_stop_id": r["o_stop"],
+                        "transfer_stop_id": r["x_stop"],
+                        "dest_stop_id": r["d_stop"],
+                        "leg1": {
+                            "trip_id": r["trip1"],
+                            "route_id": r["route1"],
+                            "direction_id": r["dir1"],
+                            "trip_headsign": r["head1"],
+                            "service_id": r["sid1"],
+                            "depart_time": r["o_dep"],
+                            "arrive_time": r["x_arr"],
+                            "depart_dt": dep1.isoformat(),
+                            "arrive_dt": arr1.isoformat(),
+                            "route_short_name": r["r1_short"],
+                            "route_long_name": r["r1_long"],
+                            "route_type": r["r1_type"],
+                            "agency_id": r["r1_agency"],
+                        },
+                        "leg2": {
+                            "trip_id": r["trip2"],
+                            "route_id": r["route2"],
+                            "direction_id": r["dir2"],
+                            "trip_headsign": r["head2"],
+                            "service_id": r["sid2"],
+                            "depart_time": r["x_dep2"],
+                            "arrive_time": r["d_arr2"],
+                            "depart_dt": dep2.isoformat(),
+                            "arrive_dt": arr2.isoformat(),
+                            "route_short_name": r["r2_short"],
+                            "route_long_name": r["r2_long"],
+                            "route_type": r["r2_type"],
+                            "agency_id": r["r2_agency"],
+                        },
+                    })
 
             if items:
                 note = "MVP: direct + up to 1 transfer (full time-dependent routing can be added later)"
@@ -1087,3 +1116,4 @@ def route_plan_one_transfer(
         "items": [],
         "note": f"No routes found within {days_ahead} day(s). Last: {last_note}",
     }
+
